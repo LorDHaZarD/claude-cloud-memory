@@ -1,0 +1,10 @@
+{
+  "name": "axon-memory",
+  "version": "1.0.0",
+  "description": "Cloud Claude sessions recall and retain through a self-hosted Hindsight memory node. A no-op outside a cloud session with AXON_DOMAIN=personal, AXON_MEMORY_URL and AXON_MEMORY_BANK set.",
+  "author": {
+    "name": "LorDHaZarD"
+  },
+  "license": "MIT",
+  "hooks": "./hooks/hooks.json"
+}

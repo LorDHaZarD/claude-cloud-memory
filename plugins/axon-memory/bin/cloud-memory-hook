@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Run the memory node's Claude Code hooks inside a cloud Claude session.
+
+    cloud-memory-hook --source plugin|repo session-start|prompt|stop|pre-compact < hook-event.json
+
+Claude Code on the web, the desktop app's Cloud sessions and project threads
+run in a VM with no tailnet, no ~/.hindsight config and no key file, and
+project threads load no repository hooks at all. This script gives them the
+same hindsight-coding-agents (hca) hooks the devices run
+(lib/axon/axon_memory.py), so their memories carry the same shape,
+tags and documents, through the plugin in this directory or a repository's
+.claude/settings.json.
+
+It does nothing, and exits 0, unless CLAUDE_CODE_REMOTE is "true" and the
+cloud environment sets AXON_DOMAIN=personal, AXON_MEMORY_URL (the public
+door over https, such as https://memory.example.org) and AXON_MEMORY_BANK. On
+a device it is always a no-op, so it never doubles the hooks `axon memory
+install` wired there, and a work session never reaches the personal node.
+AXON_MEMORY_ALLOW_HTTP=1 admits an http:// URL, for the test node only: the
+proxy adds the key to whatever it forwards, so over http it would travel in
+clear.
+
+The key never enters the VM. The environment holds it as a network secret
+for the door's host, and Anthropic's agent proxy adds the Authorization
+header after the request leaves. So the hca config written here has no
+apiToken (hca then sends no header of its own), and hca's fetch is pointed
+at the proxy with NODE_USE_ENV_PROXY=1. The gateway knows the key as
+claude-cloud and stamps trust:agent and via:claude-web on every retain; its
+recall_tags make every recall find only trust:reviewed memories.
+
+One injector per session: the first copy of this hook to run in a session
+(plugin or repo) claims it, and the other copy then exits on every event, so
+a repository that has both never injects or retains twice.
+
+    session-start  installs the pinned hca once per VM, then runs its
+                   session-start hook; on "compact" or "clear" it clears hca's
+                   per-session cache so the next prompt injects again
+    prompt         hca's UserPromptSubmit recall (once per session)
+    stop           hca's retain of the new turns into this session's document
+    pre-compact    the same retain, before the transcript is summarised
+
+Every failure is silent and exits 0: memory is a convenience, never a
+reason to block a session.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HCA_PACKAGE = "@vectorize-io/hindsight-coding-agents"
+# Must equal HINDSIGHT_CODING_AGENTS_VERSION in versions.env (the plugin is
+# installed without the rest of the repository, so it carries its own copy;
+# tests/memory-wiring/cloud-hook.sh fails when the two differ).
+HCA_VERSION = "0.8.1"
+HOOKS = {
+    "session-start": "claude-sessionstart-hook.js",
+    "prompt": "claude-hook.js",
+    "stop": "claude-stop-hook.js",
+    "pre-compact": "claude-stop-hook.js",
+}
+# Seconds each hca hook may take before it is abandoned. Recall has its own
+# 2 s budget inside hca (injectTimeoutMs); retain may wait on the node.
+HOOK_TIMEOUT = {"session-start": 20, "prompt": 8, "stop": 50, "pre-compact": 50}
+INSTALL_TIMEOUT = 90
+INJECT_TIMEOUT_MS = 2000
+SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+BANK_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# hca's own knowledge pages, off as on devices (only admin may create them).
+HCA_PAGES = (
+    "Component map",
+    "Core concepts",
+    "Conventions and patterns",
+    "Key decisions and rationale",
+    "Initiatives and enhancements",
+)
+
+
+def surface() -> str:
+    """env: tag for where the session runs. Self-reported; via: is the trusted one."""
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT") == "remote_projects" or os.environ.get("CLAUDE_CODE_PROJECTS_SESSION") == "1":
+        return "claude-project"
+    return "claude-web"
+
+
+def state_dir() -> Path:
+    return Path(os.environ.get("AXON_MEMORY_STATE", os.environ.get("COCKPIT_MEMORY_STATE")) or Path.home() / ".cache" / "axon-memory")
+
+
+def claim(state: Path, session_id: str, source: str) -> bool:
+    """True when this copy (plugin or repo) owns the session's memory hooks."""
+    owners = state / "owners"
+    owners.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = owners / session_id
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            return path.read_text(encoding="utf-8").strip() == source
+        except OSError:
+            return False
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(source + "\n")
+    return True
+
+
+def hca_dir(state: Path) -> Path:
+    return state / "hca" / "node_modules" / HCA_PACKAGE
+
+
+def installed_version(state: Path) -> str | None:
+    try:
+        return json.loads((hca_dir(state) / "package.json").read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_hca(state: Path) -> bool:
+    """Install the pinned hca into the state dir (never npx, never latest)."""
+    if installed_version(state) == HCA_VERSION:
+        return True
+    npm = shutil.which("npm")
+    if not npm:
+        return False
+    try:
+        subprocess.run(
+            [npm, "install", "--prefix", str(state / "hca"), "--no-save", "--no-audit", "--no-fund",
+             "--ignore-scripts", "--loglevel=error", f"{HCA_PACKAGE}@{HCA_VERSION}"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=INSTALL_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return installed_version(state) == HCA_VERSION
+
+
+def hca_settings(url: str, bank: str, where: str) -> dict:
+    """The device settings (axon_memory.managed_settings) without a token."""
+    return {
+        "serverMode": "self-hosted",
+        "apiUrl": url.rstrip("/"),
+        # No apiToken: hca then sends no Authorization header, and the agent
+        # proxy adds the environment's network secret for this host.
+        "bankId": bank,
+        "dynamicBankId": False,
+        "autoUpdate": False,
+        "autoInject": "recall",
+        "injectTimeoutMs": INJECT_TIMEOUT_MS,
+        "retainTags": [f"env:{where}", "project:{gitProject}"],
+        "retainMetadata": {"device": where, "repo": "{gitProject}"},
+        "manageBankConfig": False,
+        "pages": {name: False for name in HCA_PAGES},
+        "autoSeed": False,
+        "codebaseSurvey": False,
+        "toolGuideExtra": (
+            "In this cloud session, do not call hindsight_capture_initiative, hindsight_sync_status "
+            "or hindsight_reflect: the memory node refuses them for this key. "
+            f"Every title you give hindsight_ingest_document must include '{where}'."
+        ),
+    }
+
+
+def write_config(state: Path, url: str, bank: str) -> Path:
+    path = state / "coding-agent.json"
+    fd, tmp = tempfile.mkstemp(dir=state, prefix=".coding-agent.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(hca_settings(url, bank, surface()), f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return path
+
+
+def reset_session_cache(session_id: str) -> None:
+    """Make hca's next prompt hook inject again, as it does once per session."""
+    cache = Path(tempfile.gettempdir()) / "hindsight-claude-code" / f"{session_id}.json"
+    try:
+        cache.unlink()
+    except OSError:
+        pass
+
+
+def hca_env(config: Path) -> dict:
+    # hca lets HINDSIGHT_* variables override its config file (HINDSIGHT_API_URL,
+    # HINDSIGHT_API_TOKEN, HINDSIGHT_BANK_ID...), so none from the session pass.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("HINDSIGHT_")}
+    env.update({
+        "HINDSIGHT_CONFIG": str(config),
+        # Node's fetch ignores HTTPS_PROXY unless asked; the door is only
+        # reachable, and only gets the key, through the agent proxy.
+        "NODE_USE_ENV_PROXY": "1",
+        "NODE_NO_WARNINGS": "1",
+    })
+    return env
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", choices=("plugin", "repo"), required=True)
+    p.add_argument("event", choices=sorted(HOOKS))
+    a = p.parse_args(argv)
+
+    if os.environ.get("CLAUDE_CODE_REMOTE") != "true":
+        return 0
+    # The domain is confirmed, as devices confirm it before wiring: the door
+    # is the personal dev node's, and a work session must never reach it.
+    if os.environ.get("AXON_DOMAIN", os.environ.get("COCKPIT_DOMAIN")) != "personal":
+        return 0
+    url = os.environ.get("AXON_MEMORY_URL", os.environ.get("COCKPIT_MEMORY_URL", "")).strip()
+    bank = os.environ.get("AXON_MEMORY_BANK", os.environ.get("COCKPIT_MEMORY_BANK", "")).strip()
+    schemes = ("https://", "http://") if os.environ.get("AXON_MEMORY_ALLOW_HTTP", os.environ.get("COCKPIT_MEMORY_ALLOW_HTTP")) == "1" else ("https://",)
+    if not url.startswith(schemes) or not BANK_RE.match(bank):
+        return 0
+    raw = sys.stdin.buffer.read()
+    try:
+        ev = json.loads(raw or b"{}")
+    except ValueError:
+        return 0
+    session_id = str(ev.get("session_id", "")) if isinstance(ev, dict) else ""
+    if not SESSION_RE.match(session_id):
+        return 0
+
+    state = state_dir()
+    try:
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not claim(state, session_id, a.source):
+            return 0
+        if a.event == "session-start":
+            if ev.get("source") in ("compact", "clear"):
+                reset_session_cache(session_id)
+            if not ensure_hca(state):
+                return 0
+        hook = hca_dir(state) / "dist" / HOOKS[a.event]
+        if not hook.is_file() or installed_version(state) != HCA_VERSION:
+            return 0
+        config = write_config(state, url, bank)
+    except OSError:
+        return 0
+    if a.event == "pre-compact":
+        # hca's retain hook reads the same fields from a Stop event.
+        ev["hook_event_name"] = "Stop"
+        raw = json.dumps(ev).encode()
+    node = shutil.which("node")
+    if not node:
+        return 0
+    try:
+        out = subprocess.run([node, str(hook)], input=raw, capture_output=True,
+                             env=hca_env(config), timeout=HOOK_TIMEOUT[a.event], check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    # hca's stdout is the hook's JSON answer (injected context); pass it on.
+    sys.stdout.buffer.write(out.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

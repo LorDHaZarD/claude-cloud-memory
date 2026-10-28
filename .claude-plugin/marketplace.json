@@ -1,0 +1,13 @@
+{
+  "name": "claude-cloud-memory",
+  "owner": {
+    "name": "LorDHaZarD"
+  },
+  "plugins": [
+    {
+      "name": "axon-memory",
+      "source": "./plugins/axon-memory",
+      "description": "Cloud Claude sessions recall and retain through a self-hosted Hindsight memory node."
+    }
+  ]
+}
